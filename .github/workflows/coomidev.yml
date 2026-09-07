@@ -90,7 +90,7 @@ jobs:
 
       - name: Rust workspace check
         working-directory: apps/coomi-rs
-        run: cargo check --locked -p coomi-ui
+        run: cargo check -p coomi-ui
 
       - name: Build Runtime V2 assets
         run: |
