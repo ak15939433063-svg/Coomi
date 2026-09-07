@@ -42,7 +42,7 @@ export interface SessionMeta {
   /** 用户手动重命名过：true 时引擎推导的标题不再覆盖。 */
   renamed?: boolean
   /** Versioned conversation mode; older metadata defaults to agent. */
-  mode?: 'agent' | 'team' | 'life'
+  mode?: 'agent' | 'team' | 'life' | 'information' | 'reverse' | 'code'
 }
 
 export interface SessionGroup {
@@ -338,7 +338,7 @@ export const useSessionsStore = defineStore('sessions', () => {
     persistMeta()
   }
 
-  function setMode(id: string, mode: 'agent' | 'team' | 'life') {
+  function setMode(id: string, mode: 'agent' | 'team' | 'life' | 'information' | 'reverse' | 'code') {
     ensure(id).mode = mode
     persistMeta()
   }
@@ -507,7 +507,7 @@ export const useSessionsStore = defineStore('sessions', () => {
         created_at: string
         title_manually_set: boolean
         pinned: boolean
-        mode?: 'agent' | 'team' | 'life'
+        mode?: 'agent' | 'team' | 'life' | 'information' | 'reverse' | 'code'
       }>
       const localById = new Map(metas.value.map(m => [m.id, m]))
       const legacyMigrations: Array<Promise<unknown>> = []

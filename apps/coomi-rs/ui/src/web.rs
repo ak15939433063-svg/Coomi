@@ -5,6 +5,7 @@ use axum::Json;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::extract::Path as AxumPath;
+use axum::extract::Multipart;
 use axum::extract::Query;
 use axum::extract::State;
 use axum::extract::ws::Message;
@@ -86,6 +87,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::fs;
+use std::io::Cursor;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -797,6 +799,12 @@ pub async fn serve(
             "/api/runtime/custom-prompt",
             get(get_custom_prompt).post(set_custom_prompt),
         )
+        .route("/api/assistants", get(list_assistants).post(create_assistant))
+        .route(
+            "/api/assistants/{id}",
+            get(get_assistant).put(update_assistant).delete(delete_assistant),
+        )
+        .route("/api/assistants/{id}/activate", post(activate_assistant))
         .route(
             "/api/settings/connection",
             get(get_connection_settings).put(set_connection_settings),
@@ -860,6 +868,10 @@ pub async fn serve(
         )
         .route("/api/usage", get(usage_ledger))
         .route("/api/catalog", get(catalog_index))
+        .route(
+            "/api/extensions/import",
+            post(import_extensions).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
         .route("/api/workflows", get(list_workflows).post(create_workflow))
         .route("/api/workflows/templates", get(list_workflow_templates))
         .route(
@@ -1597,6 +1609,183 @@ async fn set_custom_prompt(
     settings["custom_prompt"] = json!(text);
     write_settings(&state.home, &settings)?;
     Ok(Json(json!({ "text": text })))
+}
+
+const ASSISTANT_PERSONA_MAX_CHARS: usize = 20_000;
+
+fn assistants_path(home: &Path) -> PathBuf {
+    home.join("config").join("custom_assistants.json")
+}
+
+fn read_assistants_document(home: &Path) -> Value {
+    let Ok(bytes) = std::fs::read(assistants_path(home)) else {
+        return json!({ "version": 1, "active": null, "assistants": [] });
+    };
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(value) if value.is_object() => value,
+        _ => json!({ "version": 1, "active": null, "assistants": [] }),
+    }
+}
+
+fn write_assistants_document(home: &Path, document: &Value) -> Result<(), ApiError> {
+    let path = assistants_path(home);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| ApiError::internal(format!("failed to create config dir: {e}")))?;
+    }
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(document)
+            .map_err(|e| ApiError::internal(format!("failed to serialize assistants: {e}")))?,
+    )
+    .map_err(|e| ApiError::internal(format!("failed to write assistants: {e}")))?;
+    Ok(())
+}
+
+fn assistant_record_by_id(document: &Value, id: &str) -> Option<Value> {
+    document
+        .get("assistants")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|item| item.get("id").and_then(Value::as_str) == Some(id))
+        .cloned()
+}
+
+fn normalize_assistant_payload(body: &Value, id: &str, existing: Option<&Value>) -> Value {
+    let mut record: serde_json::Map<String, Value> = body.as_object().cloned().unwrap_or_default();
+    if let Some(existing) = existing.and_then(Value::as_object) {
+        for (key, value) in existing {
+            record.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+    record.insert("id".to_owned(), json!(id));
+
+    let name_ok = record
+        .get("name")
+        .and_then(Value::as_str)
+        .map(|name| !name.trim().is_empty())
+        .unwrap_or(false);
+    if !name_ok {
+        record.insert("name".to_owned(), json!("自定义助手"));
+    }
+
+    if let Some(Value::String(persona)) = record.get("persona") {
+        record.insert(
+            "persona".to_owned(),
+            json!(persona.chars().take(ASSISTANT_PERSONA_MAX_CHARS).collect::<String>()),
+        );
+    } else {
+        record.insert("persona".to_owned(), json!(""));
+    }
+
+    Value::Object(record)
+}
+
+async fn list_assistants(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let document = read_assistants_document(&state.home);
+    let assistants = document.get("assistants").cloned().unwrap_or_else(|| json!([]));
+    let active = document.get("active").cloned().unwrap_or(Value::Null);
+    Ok(Json(json!({ "assistants": assistants, "active": active })))
+}
+
+async fn create_assistant(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let id = body
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    let mut document = read_assistants_document(&state.home);
+    let duplicate = document
+        .get("assistants")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().any(|item| item.get("id").and_then(Value::as_str) == Some(id.as_str())))
+        .unwrap_or(false);
+    if duplicate {
+        return Err(ApiError::bad_request("assistant id already exists"));
+    }
+
+    let record = normalize_assistant_payload(&body, &id, None);
+    let assistants = document
+        .get_mut("assistants")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| ApiError::internal("assistants config malformed"))?;
+    if document.get("active").and_then(Value::as_str).is_none() {
+        document["active"] = json!(id);
+    }
+    assistants.push(record.clone());
+    write_assistants_document(&state.home, &document)?;
+    Ok(Json(record))
+}
+
+async fn get_assistant(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let document = read_assistants_document(&state.home);
+    let record = assistant_record_by_id(&document, &id)
+        .ok_or_else(|| ApiError::not_found("assistant not found"))?;
+    Ok(Json(record))
+}
+
+async fn update_assistant(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let mut document = read_assistants_document(&state.home);
+    let existing = assistant_record_by_id(&document, &id)
+        .ok_or_else(|| ApiError::not_found("assistant not found"))?;
+    let record = normalize_assistant_payload(&body, &id, Some(&existing));
+    let assistants = document
+        .get_mut("assistants")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| ApiError::internal("assistants config malformed"))?;
+    if let Some(slot) = assistants.iter_mut().find(|item| item.get("id").and_then(Value::as_str) == Some(id.as_str())) {
+        *slot = record.clone();
+    } else {
+        return Err(ApiError::not_found("assistant not found"));
+    }
+    write_assistants_document(&state.home, &document)?;
+    Ok(Json(record))
+}
+
+async fn delete_assistant(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let mut document = read_assistants_document(&state.home);
+    let assistants = document
+        .get_mut("assistants")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| ApiError::internal("assistants config malformed"))?;
+    let before = assistants.len();
+    assistants.retain(|item| item.get("id").and_then(Value::as_str) != Some(id.as_str()));
+    if assistants.len() == before {
+        return Err(ApiError::not_found("assistant not found"));
+    }
+    if document.get("active").and_then(Value::as_str) == Some(id.as_str()) {
+        document["active"] = Value::Null;
+    }
+    write_assistants_document(&state.home, &document)?;
+    Ok(Json(json!({ "ok": true, "id": id })))
+}
+
+async fn activate_assistant(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let mut document = read_assistants_document(&state.home);
+    if assistant_record_by_id(&document, &id).is_none() {
+        return Err(ApiError::not_found("assistant not found"));
+    }
+    document["active"] = json!(id);
+    write_assistants_document(&state.home, &document)?;
+    Ok(Json(json!({ "ok": true, "active": document["active"] })))
 }
 
 /// 会话/配置私有区：全局会话记忆关闭时，工具对这些目录一律拒绝访问。
@@ -3448,6 +3637,205 @@ async fn set_skill_enabled_catalog(
     SkillRouter::load(&state.home)
         .map_err(|e| ApiError::internal(format!("failed to refresh Skill index: {e:#}")))?;
     Ok(Json(json!({ "ok": true, "id": id, "enabled": enabled })))
+}
+
+/// 本地导入扩展包：接受 multipart/form-data 文件 `file`。
+/// 支持同时安装一个或多个 Skill（含 SKILL.md）以及合并 MCP Server 配置。
+async fn import_extensions(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, ApiError> {
+    let mut zip_bytes: Option<Vec<u8>> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request(format!("读取上传字段失败: {error:#}")))?
+    {
+        if field.name() == Some("file") {
+            let bytes = field
+                .bytes()
+                .await
+                .map_err(|error| ApiError::bad_request(format!("读取上传文件失败: {error:#}")))?;
+            if bytes.is_empty() {
+                return Err(ApiError::bad_request("上传文件为空"));
+            }
+            zip_bytes = Some(bytes.to_vec());
+            break;
+        }
+    }
+    let bytes = zip_bytes.ok_or_else(|| ApiError::bad_request("缺少文件字段 file"))?;
+
+    let mut archive = zip::ZipArchive::new(Cursor::new(&bytes))
+        .map_err(|error| ApiError::bad_request(format!("无法解析 zip 包: {error:#}")))?;
+
+    struct SkillImport {
+        id: String,
+        base: String,
+    }
+
+    // 扫描 SKILL.md，确定每个 Skill 的 id 与提取前缀。
+    let mut skills: Vec<SkillImport> = Vec::new();
+    let mut used_ids: HashSet<String> = HashSet::new();
+    for index in 0..archive.len() {
+        let file = archive.by_index(index).map_err(|error| {
+            ApiError::bad_request(format!("读取 zip 条目 #{index} 失败: {error:#}"))
+        })?;
+        let name = file.name().replace('\\', "/");
+        if !name.ends_with("SKILL.md") {
+            continue;
+        }
+        let path = Path::new(&name);
+        let parent = path.parent();
+        let base = parent
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(|parent| format!("{}/", parent.to_string_lossy()))
+            .unwrap_or_default();
+        let raw_id = parent
+            .and_then(|parent| parent.file_name())
+            .and_then(|value| value.to_str())
+            .unwrap_or("imported-skill")
+            .to_string();
+        let mut id = raw_id.clone();
+        let mut suffix = 2;
+        while used_ids.contains(&id) {
+            id = format!("{raw_id}-{suffix}");
+            suffix += 1;
+        }
+        used_ids.insert(id.clone());
+        skills.push(SkillImport { id, base });
+    }
+
+    // 解包并安装 Skill。
+    let skill_root = state.home.join("skills");
+    fs::create_dir_all(&skill_root)
+        .map_err(|error| ApiError::internal(format!("创建 skills 目录失败: {error:#}")))?;
+    for skill in &skills {
+        let destination = skill_root.join(&skill.id);
+        fs::create_dir_all(&destination)
+            .map_err(|error| ApiError::internal(format!("创建 Skill 目录失败: {error:#}")))?;
+        for index in 0..archive.len() {
+            let mut file = archive.by_index(index).map_err(|error| {
+                ApiError::bad_request(format!("读取 zip 条目 #{index} 失败: {error:#}"))
+            })?;
+            let name = file.name().replace('\\', "/");
+            let rest = if skill.base.is_empty() {
+                if name == "SKILL.md" {
+                    "SKILL.md"
+                } else {
+                    continue;
+                }
+            } else {
+                match name.strip_prefix(&skill.base) {
+                    Some(rest) if !rest.is_empty() => rest,
+                    _ => continue,
+                }
+            };
+            if rest
+                .split('/')
+                .any(|segment| segment.is_empty() || segment == "..")
+            {
+                return Err(ApiError::bad_request(format!(
+                    "zip 包含非法路径: {name}"
+                )));
+            }
+            let target = destination.join(rest);
+            if file.is_dir() {
+                fs::create_dir_all(&target).map_err(|error| {
+                    ApiError::internal(format!("创建目录失败 {}: {error:#}", target.display()))
+                })?;
+            } else {
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent).map_err(|error| {
+                        ApiError::internal(format!("创建目录失败 {}: {error:#}", parent.display()))
+                    })?;
+                }
+                let mut output = fs::File::create(&target).map_err(|error| {
+                    ApiError::internal(format!("创建文件失败 {}: {error:#}", target.display()))
+                })?;
+                std::io::copy(&mut file, &mut output).map_err(|error| {
+                    ApiError::internal(format!("写入文件失败 {}: {error:#}", target.display()))
+                })?;
+            }
+        }
+        coomi_services::set_skill_enabled(&state.home, &skill.id, true)
+            .map_err(|error| ApiError::internal(format!("登记 Skill 失败: {error:#}")))?;
+    }
+
+    // 合并 MCP 配置。可识别包内 `mcp.json` / `mcp_servers.json`，内容为
+    // {"servers": {...}} 或直接为 servers 对象。
+    let mut mcp_merged: BTreeMap<String, Value> = BTreeMap::new();
+    for index in 0..archive.len() {
+        let mut file = archive.by_index(index).map_err(|error| {
+            ApiError::bad_request(format!("读取 zip 条目 #{index} 失败: {error:#}"))
+        })?;
+        let name = file.name().replace('\\', "/");
+        if !matches!(
+            name.rsplit('/').next().unwrap_or(&name),
+            "mcp.json" | "mcp_servers.json"
+        ) {
+            continue;
+        }
+        let mut text = String::new();
+        std::io::read_to_string(&mut file)
+            .map_err(|error| ApiError::bad_request(format!("读取 MCP 配置失败: {error:#}")))?;
+        let value: Value = serde_json::from_str(&text)
+            .map_err(|error| ApiError::bad_request(format!("MCP 配置 JSON 无效: {error:#}")))?;
+        let servers = value
+            .get("servers")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_else(|| value.as_object().cloned().unwrap_or_default());
+        mcp_merged.extend(servers);
+    }
+
+    let merged_mcp_names: Vec<String> = mcp_merged.keys().cloned().collect();
+    let merged_mcp_count = mcp_merged.len();
+    if !mcp_merged.is_empty() {
+        let path = state.home.join("config").join("mcp_servers.json");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| ApiError::internal(format!("创建 config 目录失败: {error:#}")))?;
+        }
+        let mut document: Value = if path.exists() {
+            let bytes = fs::read(&path).map_err(|error| {
+                ApiError::internal(format!("读取 MCP 配置失败: {error:#}"))
+            })?;
+            serde_json::from_slice(&bytes)
+                .map_err(|error| ApiError::bad_request(format!("现有 MCP 配置无效: {error:#}")))?
+        } else {
+            json!({"version": 1, "servers": {}})
+        };
+        let target = document
+            .get_mut("servers")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| ApiError::internal("MCP 配置缺少 servers 对象"))?;
+        for (name, server) in mcp_merged {
+            target.insert(name, server);
+        }
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&document).map_err(|error| {
+                ApiError::internal(format!("序列化 MCP 配置失败: {error:#}"))
+            })?,
+        )
+        .map_err(|error| ApiError::internal(format!("写入 MCP 配置失败: {error:#}")))?;
+    }
+
+    if skills.is_empty() && merged_mcp_count == 0 {
+        return Err(ApiError::bad_request(
+            "未在 zip 中找到 SKILL.md 或 mcp.json/mcp_servers.json，请检查扩展包结构",
+        ));
+    }
+
+    let skill_ids = skills
+        .into_iter()
+        .map(|skill| skill.id)
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "ok": true,
+        "installed_skills": skill_ids,
+        "merged_mcp_servers": merged_mcp_names,
+    })))
 }
 
 // ─────────────────────────── 会话 cwd ───────────────────────────
@@ -5637,6 +6025,9 @@ async fn handle_command(
                 Some("agent") => SessionMode::Agent,
                 Some("team") => SessionMode::Team,
                 Some("life") => SessionMode::Life,
+                Some("information") => SessionMode::Information,
+                Some("reverse") => SessionMode::Reverse,
+                Some("code") => SessionMode::Code,
                 _ => {
                     context.send_error(envelope_id, "invalid session mode");
                     return;
@@ -6606,6 +6997,21 @@ async fn run_turn(
         prompt_context.push_str("\n\nTeam role instructions (implementation phase):\n");
         prompt_context.push_str(&team_settings.coder_prompt);
     }
+      match session.mode {
+          SessionMode::Information => {
+              prompt_context.push_str("\n\nInformation operations mode (信息渗透模式):\n");
+              prompt_context.push_str("You are in information-gathering and reconnaissance mode. Enumerate attack surface, map assets, endpoints, open ports, exposed services, and data flows. Prefer non-destructive enumeration and evidence collection. Document sources, confidence, and verification status. Use available MCP tools such as webreverse for recon, network, static, and dynamic analysis. Never fabricate findings; distinguish confirmed evidence from hypotheses.");
+          }
+          SessionMode::Reverse => {
+              prompt_context.push_str("\n\nReverse engineering mode (逆向模式):\n");
+              prompt_context.push_str("You are in reverse engineering mode. Analyze binaries, APKs, DEX, native libraries, protocols, and obfuscated code. Use static and dynamic analysis tools (jadx, apktool, capstone, LIEF, Frida, hooking) where available. Recover algorithms, data structures, and control flow. Document decompilation artifacts, unresolved symbols, and verification status. Do not skip verification.");
+          }
+          SessionMode::Code => {
+              prompt_context.push_str("\n\nCode engineering mode (代码模式):\n");
+              prompt_context.push_str("You are in code engineering mode. Prioritize runnable, tested, maintainable implementation. Inspect existing repository structure before editing, keep changes scoped, preserve unrelated work, run relevant type checks and tests, and report changed files and verification results. Prefer minimal reversible changes.");
+          }
+          _ => {}
+      }
     if cognitive_enabled {
         prompt_context.push_str(&cognitive_prompt_context(life_context.as_ref().expect("life context"))?);
     }
