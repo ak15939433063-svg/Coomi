@@ -6997,6 +6997,21 @@ async fn run_turn(
         prompt_context.push_str("\n\nTeam role instructions (implementation phase):\n");
         prompt_context.push_str(&team_settings.coder_prompt);
     }
+      match session.mode {
+          SessionMode::Information => {
+              prompt_context.push_str("\n\nInformation operations mode (信息渗透模式):\n");
+              prompt_context.push_str("You are in information-gathering and reconnaissance mode. Enumerate attack surface, map assets, endpoints, open ports, exposed services, and data flows. Prefer non-destructive enumeration and evidence collection. Document sources, confidence, and verification status. Use available MCP tools such as webreverse for recon, network, static, and dynamic analysis. Never fabricate findings; distinguish confirmed evidence from hypotheses.");
+          }
+          SessionMode::Reverse => {
+              prompt_context.push_str("\n\nReverse engineering mode (逆向模式):\n");
+              prompt_context.push_str("You are in reverse engineering mode. Analyze binaries, APKs, DEX, native libraries, protocols, and obfuscated code. Use static and dynamic analysis tools (jadx, apktool, capstone, LIEF, Frida, hooking) where available. Recover algorithms, data structures, and control flow. Document decompilation artifacts, unresolved symbols, and verification status. Do not skip verification.");
+          }
+          SessionMode::Code => {
+              prompt_context.push_str("\n\nCode engineering mode (代码模式):\n");
+              prompt_context.push_str("You are in code engineering mode. Prioritize runnable, tested, maintainable implementation. Inspect existing repository structure before editing, keep changes scoped, preserve unrelated work, run relevant type checks and tests, and report changed files and verification results. Prefer minimal reversible changes.");
+          }
+          _ => {}
+      }
     if cognitive_enabled {
         prompt_context.push_str(&cognitive_prompt_context(life_context.as_ref().expect("life context"))?);
     }
