@@ -186,7 +186,7 @@ const MOCK_PROVIDERS: ProviderConfig[] = [
 export const useConfigStore = defineStore('config', () => {
   const savedPermission = localStorage.getItem('coomi.permissionMode') as PermissionMode | null
   const permissionMode = ref<PermissionMode>(['ask', 'auto', 'full'].includes(savedPermission ?? '') ? savedPermission! : 'ask')
-  const planMode = ref(false)
+  const planMode = ref(localStorage.getItem('coomi.planMode') === '1')
   const themeMode = ref<ThemeMode>(readThemeMode())
   const savedEffort = localStorage.getItem('coomi.reasoningEffort') as ReasoningEffort | null
   const reasoningEffort = ref<ReasoningEffort>(REASONING_EFFORTS.some(item => item.value === savedEffort) ? savedEffort! : 'auto')
@@ -331,7 +331,10 @@ export const useConfigStore = defineStore('config', () => {
     permissionMode.value = order[(idx + 1) % order.length]
     return permissionMode.value
   }
-  function togglePlanMode() { planMode.value = !planMode.value }
+    function togglePlanMode() {
+      planMode.value = !planMode.value
+      localStorage.setItem('coomi.planMode', planMode.value ? '1' : '0')
+    }
 
   /**
    * 全局会话记忆：关闭（默认）时 Coomi 无法读取任何历史会话文件；

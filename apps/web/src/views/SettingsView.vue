@@ -10,7 +10,7 @@ import { useSessionStore } from '@/stores/session'
 import { useSessionsStore } from '@/stores/sessions'
 import { useConnectionStore } from '@/stores/connection'
 import { authedFetch } from '@/bridge/http'
-import type { PermissionMode } from '@/protocol/commands'
+import type { PermissionMode, SessionMode } from '@/protocol/commands'
 import PageHead from '@/components/PageHead.vue'
 import CoomiIcon from '@/components/CoomiIcon.vue'
 
@@ -107,6 +107,17 @@ async function toggleTelemetry() {
 
 const MODE_ICON: Record<PermissionMode, string> = { ask: 'shield', auto: 'bolt', full: 'plusCircle' }
 
+const SESSION_MODE_ITEMS: { mode: SessionMode; label: string; desc: string; icon: string }[] = [
+  { mode: 'information', label: '信息渗透模式', desc: '独立工作台与 webreverse 工具链', icon: 'search' },
+  { mode: 'reverse', label: '逆向模式', desc: 'APK / 二进制 / 协议静态与动态分析', icon: 'target' },
+  { mode: 'code', label: '代码模式', desc: '工程实现、测试、重构与交付', icon: 'bolt' },
+]
+
+function activateSessionMode(mode: SessionMode) {
+  session.setSessionMode(mode)
+  if (mode === 'information') router.push('/security-workbench')
+}
+
 /** provider × model 拍平成一维列表，省掉一层嵌套标题。 */
 const modelRows = computed(() =>
   config.providers.flatMap(p =>
@@ -164,6 +175,14 @@ onMounted(async () => {
           </span>
           <span class="sw" :class="{ on: config.planMode }" />
         </button>
+          <button v-for="item in SESSION_MODE_ITEMS" :key="item.mode" class="row" @click="activateSessionMode(item.mode)">
+            <span class="ri" :class="{ on: session.mode === item.mode }"><CoomiIcon :name="item.icon" :size="17" /></span>
+            <span class="rt">
+              <span class="rmain">{{ item.label }}</span>
+              <span class="rsub">{{ item.desc }}</span>
+            </span>
+            <CoomiIcon v-if="session.mode === item.mode" name="check" :size="17" class="tick" />
+          </button>
         <button class="row" @click="toggleGlobalMemory">
           <span class="ri" :class="{ on: config.globalMemory }"><CoomiIcon name="clock" :size="17" /></span>
           <span class="rt">
@@ -220,11 +239,11 @@ onMounted(async () => {
 
       <p class="sec-label">身份定位</p>
       <div class="group">
-        <button class="row" @click="router.push('/persona')">
+        <button class="row" @click="router.push('/assistants')">
           <span class="ri" :class="{ on: config.customPrompt.trim() !== '' }"><CoomiIcon name="sparkle" :size="17" /></span>
           <span class="rt">
-            <span class="rmain">定制身份定位</span>
-            <span class="rsub">{{ config.customPrompt.trim() ? '已配置，置于系统提示词最前生效' : '未设置。让 AI 认知自己的身份与定位' }}</span>
+            <span class="rmain">自定义助手设置</span>
+              <span class="rsub">配置助手基础设定、提示词、记忆、扩展、MCP 与本地工具</span>
           </span>
           <CoomiIcon name="chevronRight" :size="15" class="arw" />
         </button>

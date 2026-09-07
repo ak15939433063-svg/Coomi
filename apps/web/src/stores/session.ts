@@ -21,7 +21,7 @@ export const useSessionStore = defineStore('session', () => {
   const sessions = useSessionsStore()
 
   const sessionId = ref(readActiveSessionId())
-  const mode = ref<'agent' | 'team' | 'life'>(sessions.find(sessionId.value)?.mode ?? 'agent')
+  const mode = ref<'agent' | 'team' | 'life' | 'information' | 'reverse' | 'code'>(sessions.find(sessionId.value)?.mode ?? 'agent')
   const timeline = ref<Timelineitem[]>(sessions.loadTranscript(sessionId.value))
   const runState = ref<RunState>('idle')
   const usage = ref<{
@@ -536,7 +536,7 @@ export const useSessionStore = defineStore('session', () => {
     transport.value?.send({ command: 'select_model', provider_id: providerId, model })
     sessions.setModel(sessionId.value, providerId, model)
   }
-  function setSessionMode(value: 'agent' | 'team' | 'life') {
+  function setSessionMode(value: 'agent' | 'team' | 'life' | 'information' | 'reverse' | 'code') {
     if (isBusy.value || mode.value === value) return
     mode.value = value
     sessions.setMode(sessionId.value, value)

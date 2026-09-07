@@ -70,6 +70,8 @@ const loading = ref(true)
 const error = ref('')
 const busy = ref<string | null>(null)
 const notice = ref('')
+const importingZip = ref(false)
+const zipInput = ref<HTMLInputElement | null>(null)
 /** 当前展开详情的卡片 id（卡片默认折叠，只显示名称）。 */
 const expanded = ref<string | null>(null)
 function toggleExpanded(id: string) {
@@ -361,6 +363,48 @@ async function installSkill(item: SkillItem) {
   }
 }
 
+  function pickZip() {
+    zipInput.value?.click()
+  }
+
+  async function handleZipChange(event: Event) {
+    const input = event.target as HTMLInputElement
+    const file = input.files?.[0]
+    if (!file) return
+    if (!file.name.toLowerCase().endsWith('.zip')) {
+      notice.value = '请选择 .zip 格式的扩展包'
+      input.value = ''
+      return
+    }
+    importingZip.value = true
+    busy.value = 'zip-import'
+    notice.value = ''
+    try {
+      const form = new FormData()
+      form.append('file', file)
+      const res = await authedFetch('/api/extensions/import', {
+        method: 'POST',
+        body: form,
+      })
+      const data = await parseRes(res)
+      const skills = data.installed_skills ?? []
+      const mcps = data.merged_mcp_servers ?? []
+      const parts: string[] = []
+      if (skills.length) parts.push(`${skills.length} 个 Skill`)
+      if (mcps.length) parts.push(`${mcps.length} 个 MCP`)
+      notice.value = parts.length
+        ? `导入成功：${parts.join('、')}，重启引擎或新开会话后生效`
+        : '导入成功'
+      await load()
+      await loadInstalled()
+    } catch (e) {
+      notice.value = `导入失败：${e instanceof Error ? e.message : String(e)}`
+    } finally {
+      importingZip.value = false
+      busy.value = null
+      input.value = ''
+    }
+  }
 onMounted(load)
 // 从控制台进入：返回统一回控制台（浏览器环境回聊天主页）
 function goDashboard() {
@@ -386,6 +430,19 @@ function goDashboard() {
         </button>
       </div>
 
+        <div class="import-row">
+          <input
+            ref="zipInput"
+            type="file"
+            accept=".zip"
+            class="zip-input"
+            @change="handleZipChange"
+          />
+          <button class="import-btn" :disabled="importingZip" @click="pickZip">
+            <CoomiIcon name="upload" :size="15" />
+            {{ importingZip ? '导入中…' : '本地导入 zip' }}
+          </button>
+        </div>
       <!-- 二级：MCP | Skills -->
       <div class="tabs">
         <button class="tab" :class="{ on: tab === 'mcp' }" @click="tab = 'mcp'">
@@ -732,6 +789,15 @@ function goDashboard() {
 }
 .notice.err { background: var(--danger-soft, #ffeceb); color: var(--danger, #d43d2e); }
 .hint { margin: 18px 0; text-align: center; font-size: 13px; color: var(--text-3); }
+.import-row { margin: -2px 0 12px; }
+.zip-input { display: none; }
+.import-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 40px; padding: 0 14px; border-radius: var(--r-md);
+  background: var(--blue-soft); color: var(--blue);
+  font-size: 13px; font-weight: 650;
+}
+.import-btn:disabled { opacity: 0.6; }
 
 .cards { display: flex; flex-direction: column; gap: 8px; }
 .card {

@@ -28,6 +28,9 @@ pub enum SessionMode {
     Agent,
     Team,
     Life,
+    Information,
+    Reverse,
+    Code,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
